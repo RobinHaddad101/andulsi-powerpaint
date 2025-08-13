@@ -3,7 +3,7 @@ import io
 import os
 import random
 from typing import Any, Dict
-
+from safetensors.torch import load_file
 import numpy as np
 import torch
 from PIL import Image
@@ -50,7 +50,12 @@ def _ensure_pipe() -> StableDiffusionPowerPaintBrushNetPipeline:
         filename="diffusion_pytorch_model.safetensors",
         subfolder="PowerPaint_Brushnet",
     )
-    load_model(brushnet, brushnet_weights)
+
+    bn_state = load_file(brushnet_weights)
+    bn_target = brushnet.state_dict()
+    bn_state = {k: v for k, v in bn_state.items() if k in bn_target and v.shape == bn_target[k].shape}
+    brushnet.load_state_dict(bn_state, strict=False)
+
 
     # BrushNet's dedicated text encoder
     text_encoder_brushnet = CLIPTextModel.from_pretrained(
