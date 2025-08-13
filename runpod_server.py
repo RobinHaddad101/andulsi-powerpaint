@@ -37,11 +37,18 @@ def _ensure_pipe() -> StableDiffusionPowerPaintBrushNetPipeline:
         return PIPE
 
     torch.set_grad_enabled(False)
+    # 1) Download just the base pipeline subfolder
+    from huggingface_hub import snapshot_download
+    snapshot_dir = snapshot_download(
+        HF_PPT2_REPO,
+        allow_patterns=[f"{HF_PPT2_BASE_SUBFOLDER}/*"],
+    )
+    base_path = os.path.join(snapshot_dir, HF_PPT2_BASE_SUBFOLDER)
+
+
 
     # Base components from the repo's pipeline
-    unet = UNet2DConditionModel.from_pretrained(
-        HF_PPT2_REPO, subfolder=f"{HF_PPT2_BASE_SUBFOLDER}/unet", torch_dtype=WEIGHT_DTYPE
-    )
+    unet = UNet2DConditionModel.from_pretrained(base_path, subfolder="unet", torch_dtype=WEIGHT_DTYPE)
 
     # Build BrushNet and load weights
     brushnet = BrushNetModel.from_unet(unet)
@@ -58,9 +65,7 @@ def _ensure_pipe() -> StableDiffusionPowerPaintBrushNetPipeline:
 
 
     # BrushNet's dedicated text encoder
-    text_encoder_brushnet = CLIPTextModel.from_pretrained(
-        HF_PPT2_REPO, subfolder=f"{HF_PPT2_BASE_SUBFOLDER}/text_encoder", torch_dtype=WEIGHT_DTYPE
-    )
+    text_encoder_brushnet = CLIPTextModel.from_pretrained(base_path, subfolder="text_encoder", torch_dtype=WEIGHT_DTYPE)
     te_brushnet_weights = hf_hub_download(
         repo_id=HF_PPT2_REPO,
         filename="pytorch_model.bin",
@@ -70,8 +75,7 @@ def _ensure_pipe() -> StableDiffusionPowerPaintBrushNetPipeline:
 
     # Build the pipeline from the repo's base folder (model_index.json present)
     pipe = StableDiffusionPowerPaintBrushNetPipeline.from_pretrained(
-        HF_PPT2_REPO,
-        subfolder=HF_PPT2_BASE_SUBFOLDER,
+        base_path,
         unet=unet,
         brushnet=brushnet,
         text_encoder_brushnet=text_encoder_brushnet,
@@ -80,10 +84,8 @@ def _ensure_pipe() -> StableDiffusionPowerPaintBrushNetPipeline:
     )
 
     # Add learned task tokens into tokenizer and BrushNet text encoder
-    pipe.tokenizer = TokenizerWrapper(
-        from_pretrained=HF_PPT2_REPO,
-        subfolder=f"{HF_PPT2_BASE_SUBFOLDER}/tokenizer",
-    )
+    pipe.tokenizer = TokenizerWrapper(from_pretrained=base_path, subfolder="tokenizer")
+
     add_tokens(
         tokenizer=pipe.tokenizer,
         text_encoder=pipe.text_encoder_brushnet,
