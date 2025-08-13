@@ -22,7 +22,8 @@ from powerpaint.utils.utils import TokenizerWrapper, add_tokens
 # Model bootstrap (global)
 # ------------------------------
 HF_PPT2_REPO = os.environ.get("PPT2_REPO", "JunhaoZhuang/PowerPaint-v2-1")
-BASE_MODEL_REPO = os.environ.get("BASE_MODEL", "runwayml/stable-diffusion-v1-5")
+# Use the base pipeline shipped in the repo
+HF_PPT2_BASE_SUBFOLDER = os.environ.get("PPT2_BASE_SUBFOLDER", "realisticVisionV60B1_v51VAE")
 WEIGHT_DTYPE = torch.float16 if os.environ.get("WEIGHT_DTYPE", "float16") == "float16" else torch.float32
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -37,11 +38,12 @@ def _ensure_pipe() -> StableDiffusionPowerPaintBrushNetPipeline:
 
     torch.set_grad_enabled(False)
 
+    # Base components from the repo's pipeline
     unet = UNet2DConditionModel.from_pretrained(
-        BASE_MODEL_REPO, subfolder="unet", torch_dtype=WEIGHT_DTYPE
+        HF_PPT2_REPO, subfolder=f"{HF_PPT2_BASE_SUBFOLDER}/unet", torch_dtype=WEIGHT_DTYPE
     )
 
-    # Build BrushNet from the base UNet then load weights from HF repo files
+    # Build BrushNet and load weights
     brushnet = BrushNetModel.from_unet(unet)
     brushnet_weights = hf_hub_download(
         repo_id=HF_PPT2_REPO,
@@ -50,9 +52,9 @@ def _ensure_pipe() -> StableDiffusionPowerPaintBrushNetPipeline:
     )
     load_model(brushnet, brushnet_weights)
 
-    # Build the dedicated text encoder used by BrushNet and load its weights
+    # BrushNet's dedicated text encoder
     text_encoder_brushnet = CLIPTextModel.from_pretrained(
-        BASE_MODEL_REPO, subfolder="text_encoder", torch_dtype=WEIGHT_DTYPE
+        HF_PPT2_REPO, subfolder=f"{HF_PPT2_BASE_SUBFOLDER}/text_encoder", torch_dtype=WEIGHT_DTYPE
     )
     te_brushnet_weights = hf_hub_download(
         repo_id=HF_PPT2_REPO,
@@ -61,18 +63,21 @@ def _ensure_pipe() -> StableDiffusionPowerPaintBrushNetPipeline:
     )
     text_encoder_brushnet.load_state_dict(torch.load(te_brushnet_weights, map_location="cpu"), strict=False)
 
+    # Build the pipeline from the repo's base folder (model_index.json present)
     pipe = StableDiffusionPowerPaintBrushNetPipeline.from_pretrained(
-        BASE_MODEL_REPO,
+        HF_PPT2_REPO,
+        subfolder=HF_PPT2_BASE_SUBFOLDER,
+        unet=unet,
         brushnet=brushnet,
         text_encoder_brushnet=text_encoder_brushnet,
         torch_dtype=WEIGHT_DTYPE,
         safety_checker=None,
     )
 
-    # Add learned task tokens into tokenizer and text encoder (BrushNet branch)
+    # Add learned task tokens into tokenizer and BrushNet text encoder
     pipe.tokenizer = TokenizerWrapper(
-        from_pretrained=BASE_MODEL_REPO,
-        subfolder="tokenizer",
+        from_pretrained=HF_PPT2_REPO,
+        subfolder=f"{HF_PPT2_BASE_SUBFOLDER}/tokenizer",
     )
     add_tokens(
         tokenizer=pipe.tokenizer,
@@ -221,11 +226,9 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         result = pipe(
             promptA=prompts["promptA"],
             promptB=prompts["promptB"],
-            prompt=prompts["prompt"],
             promptU=prompts["prompt"],
             negative_promptA=prompts["negative_promptA"],
             negative_promptB=prompts["negative_promptB"],
-            negative_prompt=prompts["negative_prompt"],
             negative_promptU=prompts["negative_prompt"],
             tradoff=tradeoff,
             tradoff_nag=tradeoff,
