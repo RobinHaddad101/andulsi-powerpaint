@@ -10,9 +10,12 @@ from PIL import Image
 
 import runpod
 from transformers import CLIPTextModel
+from huggingface_hub import hf_hub_download
+from safetensors.torch import load_model
 
 from powerpaint.models import BrushNetModel, UNet2DConditionModel
 from powerpaint.pipelines import StableDiffusionPowerPaintBrushNetPipeline
+from powerpaint.utils.utils import TokenizerWrapper, add_tokens
 
 
 # ------------------------------
@@ -36,31 +39,47 @@ def _ensure_pipe() -> StableDiffusionPowerPaintBrushNetPipeline:
 
     unet = UNet2DConditionModel.from_pretrained(
         BASE_MODEL_REPO, subfolder="unet", torch_dtype=WEIGHT_DTYPE
-    ).to(DEVICE)
-
-    brushnet = BrushNetModel.from_pretrained(
-        HF_PPT2_REPO, subfolder="brushnet", torch_dtype=WEIGHT_DTYPE
-    ).to(DEVICE)
-
-    text_encoder = CLIPTextModel.from_pretrained(
-        HF_PPT2_REPO, subfolder="text_encoder", torch_dtype=WEIGHT_DTYPE
     )
+
+    # Build BrushNet from the base UNet then load weights from HF repo files
+    brushnet = BrushNetModel.from_unet(unet)
+    brushnet_weights = hf_hub_download(
+        repo_id=HF_PPT2_REPO,
+        filename="diffusion_pytorch_model.safetensors",
+        subfolder="PowerPaint_Brushnet",
+    )
+    load_model(brushnet, brushnet_weights)
+
+    # Build the dedicated text encoder used by BrushNet and load its weights
+    text_encoder_brushnet = CLIPTextModel.from_pretrained(
+        BASE_MODEL_REPO, subfolder="text_encoder", torch_dtype=WEIGHT_DTYPE
+    )
+    te_brushnet_weights = hf_hub_download(
+        repo_id=HF_PPT2_REPO,
+        filename="pytorch_model.bin",
+        subfolder="PowerPaint_Brushnet",
+    )
+    text_encoder_brushnet.load_state_dict(torch.load(te_brushnet_weights, map_location="cpu"), strict=False)
 
     pipe = StableDiffusionPowerPaintBrushNetPipeline.from_pretrained(
         BASE_MODEL_REPO,
-        unet=unet,
         brushnet=brushnet,
-        text_encoder=text_encoder,
+        text_encoder_brushnet=text_encoder_brushnet,
         torch_dtype=WEIGHT_DTYPE,
         safety_checker=None,
     )
 
-    # Task prompt tokens used by PowerPaint training
-    pipe.add_tokens(
+    # Add learned task tokens into tokenizer and text encoder (BrushNet branch)
+    pipe.tokenizer = TokenizerWrapper(
+        from_pretrained=BASE_MODEL_REPO,
+        subfolder="tokenizer",
+    )
+    add_tokens(
+        tokenizer=pipe.tokenizer,
+        text_encoder=pipe.text_encoder_brushnet,
         placeholder_tokens=["P_obj", "P_ctxt", "P_shape"],
-        initializer_tokens=["a", "a", "a"],
-        num_vectors_per_token=[10, 10, 10],
-        initialize_parameters=False,
+        initialize_tokens=["a", "a", "a"],
+        num_vectors_per_token=10,
     )
 
     pipe = pipe.to(DEVICE)
@@ -203,10 +222,13 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             promptA=prompts["promptA"],
             promptB=prompts["promptB"],
             prompt=prompts["prompt"],
+            promptU=prompts["prompt"],
             negative_promptA=prompts["negative_promptA"],
             negative_promptB=prompts["negative_promptB"],
             negative_prompt=prompts["negative_prompt"],
-            tradeoff=tradeoff,
+            negative_promptU=prompts["negative_prompt"],
+            tradoff=tradeoff,
+            tradoff_nag=tradeoff,
             image=masked_image,
             mask=mask_resized,
             num_inference_steps=steps,
