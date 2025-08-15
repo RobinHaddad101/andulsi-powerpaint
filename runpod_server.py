@@ -6,7 +6,7 @@ from typing import Any, Dict
 from safetensors.torch import load_file
 import numpy as np
 import torch
-from PIL import Image
+from PIL import Image, ImageFilter # Import ImageFilter
 
 import runpod
 from transformers import CLIPTextModel
@@ -146,8 +146,10 @@ def _build_prompts(task: str, user_prompt: str, user_negative: str) -> Dict[str,
             "negative_promptB": "P_obj",
         }
     elif task == "image-outpainting":
+        # Note: app.py adds "empty scene" for ppt-v2 which maps to BrushNet pipeline
+        # Here, we only have BrushNet pipeline, so we directly add "empty scene"
         return {
-            "prompt": f"{user_prompt} empty scene blur",
+            "prompt": f"{user_prompt} empty scene",
             "negative_prompt": f"{user_negative}, worst quality, low quality, normal quality, bad quality, blurry",
             "promptA": "P_ctxt",
             "promptB": "P_ctxt",
@@ -185,7 +187,6 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
 
     inputs = event.get("input", {})
     image_b64: str = inputs.get("image")
-    mask_b64: str = inputs.get("mask")
     task: str = inputs.get("task", "object-removal")
     prompt: str = inputs.get("prompt", "")
     negative_prompt: str = inputs.get("negative_prompt", "")
@@ -193,6 +194,11 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
     guidance_scale: float = float(inputs.get("guidance_scale", 10.0))
     tradeoff: float = float(inputs.get("fitting_degree", 1.0))
     max_side: int | None = inputs.get("max_side")
+
+    # Parse vertical_expansion_ratio and horizontal_expansion_ratio
+    vertical_expansion_ratio: float = float(inputs.get("vertical_expansion_ratio", 1.0))
+    horizontal_expansion_ratio: float = float(inputs.get("horizontal_expansion_ratio", 1.0))
+
     if isinstance(max_side, str) and max_side.isdigit():
         max_side = int(max_side)
     elif isinstance(max_side, (int, float)):
@@ -205,27 +211,72 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
         seed = random.randint(0, 2**31 - 1)
     seed = int(seed)
 
-    if not image_b64 or not mask_b64:
-        return {"error": "Both 'image' and 'mask' base64 strings are required."}
+    if not image_b64:
+        return {"error": "'image' base64 string is required."}
 
-    # Decode inputs
+    # Decode input image
     image = _b64_to_pil(image_b64)
-    mask = _b64_to_pil(mask_b64)
 
-    # Ensure same size
-    if image.size != mask.size:
-        mask = mask.resize(image.size, Image.NEAREST)
+    original_width, original_height = image.size
 
-    # Resize for memory and ensure divisible by 8
-    image_resized = _resize_divisible_by_8(image, max_side=max_side)
-    mask_resized = mask.resize(image_resized.size, Image.NEAREST)
+    # Handle image outpainting: create expanded image and mask
+    if task == "image-outpainting":
+        o_W, o_H = original_width, original_height
+        c_W = int(horizontal_expansion_ratio * o_W)
+        c_H = int(vertical_expansion_ratio * o_H)
 
-    # Build masked image (black holes)
+        # Ensure output size is at least original image size if ratios are <= 1
+        if c_W < o_W: c_W = o_W
+        if c_H < o_H: c_H = o_H
+
+        expand_img = np.ones((c_H, c_W, 3), dtype=np.uint8) * 127 # Grey background
+        original_img_np = np.array(image)
+        
+        # Calculate paste coordinates to center the original image
+        paste_x = int((c_W - o_W) / 2.0)
+        paste_y = int((c_H - o_H) / 2.0)
+
+        expand_img[paste_y : paste_y + o_H, paste_x : paste_x + o_W, :] = original_img_np
+
+        blurry_gap = 10 # from app.py
+        expand_mask_np = np.ones((c_H, c_W, 3), dtype=np.uint8) * 255 # White mask (255 = masked)
+
+        # Create a "hole" in the mask corresponding to the original image area,
+        # but with a blurry gap at the edges, similar to app.py
+        if vertical_expansion_ratio == 1 and horizontal_expansion_ratio != 1:
+            expand_mask_np[paste_y : paste_y + o_H, paste_x + blurry_gap : paste_x + o_W - blurry_gap, :] = 0
+        elif vertical_expansion_ratio != 1 and horizontal_expansion_ratio == 1:
+            expand_mask_np[paste_y + blurry_gap : paste_y + o_H - blurry_gap, paste_x : paste_x + o_W, :] = 0
+        else: # Covers horizontal and vertical expansion, and no expansion (if ratios are 1)
+            expand_mask_np[paste_y + blurry_gap : paste_y + o_H - blurry_gap, paste_x + blurry_gap : paste_x + o_W - blurry_gap, :] = 0
+        
+        image_for_pipeline = Image.fromarray(expand_img)
+        mask_for_pipeline = Image.fromarray(expand_mask_np)
+
+        # Resize the expanded image and mask
+        image_resized = _resize_divisible_by_8(image_for_pipeline, max_side=max_side)
+        mask_resized = mask_for_pipeline.resize(image_resized.size, Image.NEAREST)
+
+    else:
+        # Original inpainting/object removal logic for other tasks
+        mask_b64: str = inputs.get("mask")
+        if not mask_b64:
+            return {"error": "'mask' base64 string is required for tasks other than image-outpainting."}
+        mask = _b64_to_pil(mask_b64)
+        if image.size != mask.size:
+            mask = mask.resize(image.size, Image.NEAREST)
+
+        image_resized = _resize_divisible_by_8(image, max_side=max_side)
+        mask_resized = mask.resize(image_resized.size, Image.NEAREST)
+
+    # Build masked image (black holes) based on the *resized* mask and image
+    # This is for the `image` argument of the pipeline which expects masked regions to be black.
     hole_value = (0, 0, 0)
-    masked_image = Image.composite(Image.new("RGB", image_resized.size, hole_value), image_resized, mask_resized.convert("L"))
+    masked_image_for_pipeline = Image.composite(Image.new("RGB", image_resized.size, hole_value), image_resized, mask_resized.convert("L"))
 
     # Set prompts
     prompts = _build_prompts(task, prompt, negative_prompt)
+    print(f"DEBUG: Prompts used: {prompts}") # Logging prompts for debugging
 
     # Inference
     g = torch.Generator(device=DEVICE).manual_seed(seed)
@@ -239,8 +290,8 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             negative_promptU=prompts["negative_prompt"],
             tradoff=tradeoff,
             tradoff_nag=tradeoff,
-            image=masked_image,
-            mask=mask_resized,
+            image=masked_image_for_pipeline, # Use the prepared masked image
+            mask=mask_resized, # Use the resized mask
             num_inference_steps=steps,
             generator=g,
             brushnet_conditioning_scale=1.0,
@@ -248,19 +299,20 @@ def handler(event: Dict[str, Any]) -> Dict[str, Any]:
             width=image_resized.size[0],
             height=image_resized.size[1],
         ).images[0]
-
-    # Paste the inpainting result back to resized original using (optionally augmented) mask
-    result_paste = Image.composite(result, image_resized, mask_resized.convert("L"))
-
-    # If we resized, optionally upscale back to original size for output
-    if result_paste.size != image.size:
-        result_paste = result_paste.resize(image.size, Image.LANCZOS)
+    
+    # If we resized the initial image, upscale the result back to the target expanded size
+    # For tasks other than outpainting, it should resize to original image size
+    final_output_image_size = (c_W, c_H) if task == "image-outpainting" else (original_width, original_height)
+    if result.size != final_output_image_size:
+        result = result.resize(final_output_image_size, Image.LANCZOS)
+    
+    print(f"Outpainting completed. Result image size: {result.size}") # Log the final image size
 
     return {
-        "output": _pil_to_b64(result_paste),
+        "output": _pil_to_b64(result), # Return the final outpainted/inpainted image
         "seed": seed,
-        "width": result_paste.size[0],
-        "height": result_paste.size[1],
+        "width": result.size[0],
+        "height": result.size[1],
     }
 
 
